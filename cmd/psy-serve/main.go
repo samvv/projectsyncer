@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -52,7 +53,7 @@ func (app App) AddRepo(name string) error {
 }
 
 type Client struct {
-	app App
+	app     App
 	tcpConn net.Conn
 	sshConn *ssh.ServerConn
 }
@@ -102,7 +103,7 @@ func main() {
 			log.Printf("Failed to perform SSH handshake: %s", err)
 			continue
 		}
-		client := Client { app, tcpConn, sshConn }
+		client := Client{app, tcpConn, sshConn}
 		log.Printf("New SSH connection from %s (%s)", sshConn.RemoteAddr(), sshConn.ClientVersion())
 		// Discard all global out-of-band Requests
 		go ssh.DiscardRequests(reqs)
@@ -111,18 +112,27 @@ func main() {
 	}
 }
 
-var allowed = map[string]struct {} {
-	"git-upload-pack": {},
+var allowed = map[string]struct{}{
+	"git-upload-pack":    {},
 	"git-upload-archive": {},
-	"git-receive-pack": {},
+	"git-receive-pack":   {},
 }
 
 func (client Client) handleChannels(channels <-chan ssh.NewChannel) {
 
-	defer func () { log.Println("CLOSING TCP"); log.Printf("%s", client.tcpConn.Close()) }()
-	defer func () { log.Println("CLOSING SSH"); log.Printf("%s", client.sshConn.Close()) }()
+	// Apparently this is not necessary
+	defer func() {
+		err := client.tcpConn.Close()
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Printf("Failed to close TCP connection: %s", err)
+		}
+		err = client.sshConn.Close()
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Printf("Failed to close SSH connection: %s", err)
+		}
+	}()
 
-	var wg sync.WaitGroup 
+	var wg sync.WaitGroup
 
 	for newChannel := range channels {
 
@@ -142,11 +152,16 @@ func (client Client) handleChannels(channels <-chan ssh.NewChannel) {
 				log.Printf("Could not accept channel: %s", err)
 				return
 			}
-			defer func () { log.Printf("CLOSING CHANNEL: %s", channel.Close()); }()
+			defer func() {
+				err := channel.Close()
+				if err != nil {
+					log.Printf("Failed to close channel: %s", err)
+				}
+			}()
 
 			for req := range requests {
 
-				switch (req.Type) {
+				switch req.Type {
 
 				case "exec":
 
@@ -164,7 +179,7 @@ func (client Client) handleChannels(channels <-chan ssh.NewChannel) {
 					repoId := argv[1]
 
 					_, ok := allowed[cmdName]
-					if ! ok {
+					if !ok {
 						log.Printf("Client trying to run '%s', which is not a supported command", cmdName)
 						channel.Stderr().Write([]byte(fmt.Sprintf("'%s' is not a supported command\n", cmdName)))
 						req.Reply(false, nil)
@@ -174,80 +189,25 @@ func (client Client) handleChannels(channels <-chan ssh.NewChannel) {
 					repoPath := filepath.Join(client.app.repoPath, repoId)
 
 					req.Reply(true, nil)
-					log.Print("REPLIED")
 
-					cmd := exec.Command(cmdName, ".")
-					cmd.Dir = repoPath
-					cmd.Env = []string {} // For security reasons
+					log.Printf("%s", repoId)
+
+					cmd := exec.Command(cmdName, repoPath)
+					cmd.Env = []string{} // For security reasons
 
 					cmd.Stdin = channel
 					cmd.Stdout = channel
 					cmd.Stderr = os.Stderr
 
-					// err = cmd.Run()
-					// if err != nil {
-					// 	channel.Stderr().Write([]byte("Internal server error. Try again later. Administrators should read the logs.\n"))
-					// 	log.Printf("Failed to run '%s': %s", cmdName, err)
-					// 	req.Reply(false, nil)
-					// 	continue
-					// }
+					err = cmd.Run()
+					if err != nil {
+						channel.Stderr().Write([]byte("Internal server error. Try again later. Administrators should read the logs.\n"))
+						log.Printf("Failed to run '%s': %s", cmdName, err)
+						req.Reply(false, nil)
+						continue
+					}
 
-					// // Use pipes instead of directly attaching to the channel
-					// stdinPipe, err := cmd.StdinPipe()
-					// if err != nil {
-					// 	log.Printf("Failed to create stdin pipe: %v", err)
-					// 	req.Reply(false, nil)
-					// 	return
-					// }
-					// stdoutPipe, err := cmd.StdoutPipe()
-					// if err != nil {
-					// 	log.Printf("Failed to create stdout pipe: %v", err)
-					// 	req.Reply(false, nil)
-					// 	return
-					// }
-					// stderrPipe, err := cmd.StderrPipe()
-					// if err != nil {
-					// 	log.Printf("Failed to create stderr pipe: %v", err)
-					// 	req.Reply(false, nil)
-					// 	return
-					// }
-
-					// // Start the command
-					// if err := cmd.Start(); err != nil {
-					// 	log.Printf("Failed to start command: %v", err)
-					// 	req.Reply(false, nil)
-					// 	return
-					// }
-
-					// // Send success reply to the SSH client
-					// req.Reply(true, nil)
-
-					// // Forward data between the SSH channel and the command
-					// go func() {
-					// 	// defer stdinPipe.Close()
-					// 	if _, err := io.Copy(stdinPipe, channel); err != nil {
-					// 		log.Printf("Failed to copy input to command: %v", err)
-					// 	}
-					// }()
-
-					// go func() {
-					// 	// defer stdoutPipe.Close()
-					// 	if _, err := io.Copy(channel, stdoutPipe); err != nil {
-					// 		log.Printf("Failed to copy output from command: %v", err)
-					// 	}
-					// }()
-
-					// go func() {
-					// 	// defer stderrPipe.Close()
-					// 	if _, err := io.Copy(channel.Stderr(), stderrPipe); err != nil {
-					// 		log.Printf("Failed to copy stderr from command: %v", err)
-					// 	}
-					// }()
-
-					// // Wait for the command to complete
-					// if err := cmd.Wait(); err != nil {
-					// 	log.Printf("Command failed: %v", err)
-					// }
+					channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
 
 					return
 
@@ -255,6 +215,7 @@ func (client Client) handleChannels(channels <-chan ssh.NewChannel) {
 					channel.Stderr().Write([]byte("You are trying to open a shell on a Git server, which is not supported.\n"))
 					req.Reply(false, nil)
 					log.Println("Client requested interactive session, which is not supported.")
+					channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
 					return
 
 				default:
@@ -273,7 +234,4 @@ func (client Client) handleChannels(channels <-chan ssh.NewChannel) {
 
 	wg.Wait()
 
-}
-
-func handleChannel(newChannel ssh.NewChannel, app App) {
 }
